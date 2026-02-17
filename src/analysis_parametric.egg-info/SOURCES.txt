@@ -1,0 +1,9 @@
+pyproject.toml
+src/analysis_parametric.egg-info/PKG-INFO
+src/analysis_parametric.egg-info/SOURCES.txt
+src/analysis_parametric.egg-info/dependency_links.txt
+src/analysis_parametric.egg-info/top_level.txt
+src/in_silico/__init__.py
+src/in_silico/analyses/reverse_correlation.py
+src/in_silico/model/wrapper.py
+src/in_silico/stimuli/sparse_noise.py
