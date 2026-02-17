@@ -1,72 +1,63 @@
-# src/psa/analyses/rf_reverse_corr.py
-from __future__ import annotations
 import numpy as np
 
-
-def zscore_time(x: np.ndarray, axis: int = -1, eps: float = 1e-8) -> np.ndarray:
-    """Z-score along time axis (default last axis)."""
-    m = x.mean(axis=axis, keepdims=True)
-    s = x.std(axis=axis, keepdims=True)
-    return (x - m) / (s + eps)
-
-
-def reverse_corr_rf(
-    frames_tchw: np.ndarray,
-    pred_units_t: np.ndarray,
+def reverse_corr_rf_batch_sum(
+    frames_btchw: np.ndarray,          # (B,T,C,H,W)
+    pred_but: np.ndarray,              # (B,U,T_pred)
     lags: list[int] | tuple[int, ...] = (0, 1, 2, 3),
     channel: int = 0,
     skip_frames: int = 0,
     center_stim: bool = True,
     center_resp: bool = True,
-) -> np.ndarray:
+):
     """
-    Reverse-correlation RF estimate.
-
-    Args:
-      frames_tchw: (T, C, H, W) float32 in [0,1]
-      pred_units_t: (U, T_pred) float32 (predicted responses)
-      lags: list of non-negative integer lags in frames
-            RF at lag L correlates response[t] with stimulus[t-L]
-      channel: which channel to use (0 for luminance if rgb repeated)
-      skip_frames: if your model drops first N frames (e.g. skip_samples),
-                   set skip_frames=N so pred aligns to frames[skip_frames:].
-      center_stim/center_resp: subtract mean across time before correlation.
+    Accumulate reverse-correlation numerator+denominator across a batch.
 
     Returns:
-      rf: (U, len(lags), H, W) float32
+      rf_sum: (U, L, H, W) sum over (b,t) of resp * stim
+      n_sum:  (L,) total number of timepoints contributing per lag
+             (so you can divide at the very end across all batches)
     """
-    assert frames_tchw.ndim == 4, "frames must be (T,C,H,W)"
-    assert pred_units_t.ndim == 2, "pred must be (U,T_pred)"
+    assert frames_btchw.ndim == 5, "frames must be (B,T,C,H,W)"
+    assert pred_but.ndim == 3, "pred must be (B,U,T_pred)"
 
-    stim = frames_tchw[:, channel]  # (T,H,W)
-    T_stim = stim.shape[0]
-    U, T_pred = pred_units_t.shape
+    B, T_stim, C, H, W = frames_btchw.shape
+    B2, U, T_pred = pred_but.shape
+    assert B == B2
 
-    # Align: predictions correspond to stim indices [skip_frames : skip_frames+T_pred)
-    stim_aligned = stim[skip_frames: skip_frames + T_pred]
-    T = min(stim_aligned.shape[0], T_pred)
-    stim_aligned = stim_aligned[:T]
-    resp = pred_units_t[:, :T]
+    # pick one channel: (B,T,H,W)
+    stim = frames_btchw[:, :, channel, :, :]
+
+    # align stim to predictions: pred corresponds to stim indices [skip_frames : skip_frames+T_pred)
+    stim_aligned = stim[:, skip_frames: skip_frames + T_pred, :, :]  # (B, Ta, H, W)
+    Ta = stim_aligned.shape[1]
+    T_use = min(Ta, T_pred)
+
+    stim_aligned = stim_aligned[:, :T_use, :, :]  # (B,T,H,W)
+    resp = pred_but[:, :, :T_use]                 # (B,U,T)
 
     if center_stim:
-        stim_aligned = stim_aligned - stim_aligned.mean(axis=0, keepdims=True)
+        # subtract mean over time (per stimulus) at each pixel
+        stim_aligned = stim_aligned - stim_aligned.mean(axis=1, keepdims=True)  # (B,1,H,W)
     if center_resp:
-        resp = resp - resp.mean(axis=1, keepdims=True)
+        # subtract mean over time (per stimulus, per unit)
+        resp = resp - resp.mean(axis=2, keepdims=True)  # (B,U,1)
 
-    H, W = stim_aligned.shape[1:]
-    rf = np.zeros((U, len(lags), H, W), dtype=np.float32)
+    L = len(lags)
+    rf_sum = np.zeros((U, L, H, W), dtype=np.float32)
+    n_sum = np.zeros((L,), dtype=np.int64)
 
     for j, lag in enumerate(lags):
         if lag < 0:
             raise ValueError("lags must be non-negative ints")
-        if lag >= T:
+        if lag >= T_use:
             continue
 
-        # response at time t corresponds to stimulus at time t-lag
-        stim_l = stim_aligned[: T - lag]          # (T-lag,H,W)
-        resp_l = resp[:, lag: lag + (T - lag)]    # (U,T-lag)
+        # stimulus at time (t-lag) paired with response at time t
+        stim_l = stim_aligned[:, :T_use - lag, :, :]          # (B,T-lag,H,W)
+        resp_l = resp[:, :, lag:lag + (T_use - lag)]          # (B,U,T-lag)
 
-        # Correlation-like estimate: sum_t resp[u,t] * stim[t,h,w]
-        rf[:, j] = np.einsum("ut,thw->uhw", resp_l, stim_l) / float(T - lag)
+        # sum over batch and time: (U,H,W)
+        rf_sum[:, j] += np.einsum("but,bthw->uhw", resp_l, stim_l).astype(np.float32)
+        n_sum[j] += B * (T_use - lag)
 
-    return rf
+    return rf_sum, n_sum
