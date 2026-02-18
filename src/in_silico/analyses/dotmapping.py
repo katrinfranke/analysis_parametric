@@ -8,7 +8,118 @@ import numpy as np
 from tqdm.auto import tqdm
 
 from in_silico.stimuli.sparse_noise import SparseNoiseSpec, make_sparse_noise
-from in_silico.analyses.normalize_input import normalize_input
+
+# RGB statistics in 0–255 space (used for model input normalisation)
+_RGB_MEAN_255 = np.array([101.53574522, 93.05977233, 81.9272337], dtype=np.float32)
+_RGB_STD_255 = np.array([65.57974361, 63.30442289, 65.71941174], dtype=np.float32)
+
+
+def normalize_input(x: np.ndarray) -> np.ndarray:
+    """Normalize RGB input using fixed 0–255 mean/std.
+
+    Parameters
+    ----------
+    x:
+        Array with shape (T, C, H, W) or (C, H, W).
+        Accepts uint8 in [0, 255], float in [0, 255], or float in [0, 1]
+        (auto-detected and scaled).
+
+    Returns
+    -------
+    np.ndarray
+        float32 normalized array, same shape as input.
+    """
+    if x.ndim not in (3, 4):
+        raise ValueError(f"Expected 3D or 4D input, got shape {x.shape}")
+
+    x = x.astype(np.float32)
+
+    if x.max() <= 1.0:
+        x = x * 255.0
+
+    if x.shape[-3] != 3:
+        raise ValueError(f"Expected 3 channels, got shape {x.shape}")
+
+    if x.ndim == 4:
+        mean = _RGB_MEAN_255[None, :, None, None]
+        std = _RGB_STD_255[None, :, None, None]
+    else:
+        mean = _RGB_MEAN_255[:, None, None]
+        std = _RGB_STD_255[:, None, None]
+
+    return (x - mean) / std
+
+
+def reverse_corr_rf_batch_sum(
+    frames_btchw: np.ndarray,
+    pred_but: np.ndarray,
+    lags: list[int] | tuple[int, ...] = (0, 1, 2, 3),
+    channel: int = 0,
+    skip_frames: int = 0,
+    center_stim: bool = True,
+    center_resp: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Accumulate reverse-correlation numerator and denominator across a batch.
+
+    Parameters
+    ----------
+    frames_btchw:
+        Stimulus frames, shape (B, T, C, H, W).
+    pred_but:
+        Neural predictions, shape (B, U, T_pred).
+    lags:
+        Non-negative integer lags (in frames) at which to compute the RF.
+    channel:
+        Stimulus channel to use.
+    skip_frames:
+        Number of leading stimulus frames that have no corresponding prediction.
+    center_stim:
+        Subtract per-stimulus temporal mean at each pixel before correlating.
+    center_resp:
+        Subtract per-stimulus per-unit temporal mean before correlating.
+
+    Returns
+    -------
+    rf_sum : np.ndarray, shape (U, L, H, W)
+        Accumulated sum of response-weighted stimulus across (batch, time).
+    n_sum : np.ndarray, shape (L,)
+        Total number of timepoints contributing per lag (divide rf_sum by this
+        at the end to get the mean RF).
+    """
+    assert frames_btchw.ndim == 5, "frames must be (B,T,C,H,W)"
+    assert pred_but.ndim == 3, "pred must be (B,U,T_pred)"
+
+    B, T_stim, C, H, W = frames_btchw.shape
+    B2, U, T_pred = pred_but.shape
+    assert B == B2
+
+    stim = frames_btchw[:, :, channel, :, :]  # (B,T,H,W)
+
+    stim_aligned = stim[:, skip_frames: skip_frames + T_pred, :, :]
+    T_use = min(stim_aligned.shape[1], T_pred)
+    stim_aligned = stim_aligned[:, :T_use, :, :]
+    resp = pred_but[:, :, :T_use]
+
+    if center_stim:
+        stim_aligned = stim_aligned - stim_aligned.mean(axis=1, keepdims=True)
+    if center_resp:
+        resp = resp - resp.mean(axis=2, keepdims=True)
+
+    L = len(lags)
+    rf_sum = np.zeros((U, L, H, W), dtype=np.float32)
+    n_sum = np.zeros((L,), dtype=np.int64)
+
+    for j, lag in enumerate(lags):
+        if lag < 0:
+            raise ValueError("lags must be non-negative ints")
+        if lag >= T_use:
+            continue
+        stim_l = stim_aligned[:, :T_use - lag, :, :]
+        resp_l = resp[:, :, lag:lag + (T_use - lag)]
+        rf_sum[:, j] += np.einsum("but,bthw->uhw", resp_l, stim_l).astype(np.float32)
+        n_sum[j] += B * (T_use - lag)
+
+    return rf_sum, n_sum
 
 
 def downsample_avg_pool_nchw(x: np.ndarray, factor: int) -> np.ndarray:
