@@ -89,7 +89,9 @@ def _apply_pink_filter_2d(noise: np.ndarray) -> np.ndarray:
     fx = np.fft.fftfreq(W).astype(np.float32)[None, :]   # (1, W)
     f = np.sqrt(fy ** 2 + fx ** 2)
     f[0, 0] = 1.0          # avoid division by zero at DC
-    h_filt = 1.0 / f       # 1/f amplitude filter  →  1/f² power spectrum
+    # softer options
+    h_filt = 1.0 / np.sqrt(f)   # 1/f^0.5 amplitude → 1/f power spectrum
+    # h_filt = f ** (-0.75)        # somewhere in between
     h_filt[0, 0] = 0.0     # zero DC component
 
     result = np.empty_like(noise, dtype=np.float32)
