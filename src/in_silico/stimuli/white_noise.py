@@ -28,8 +28,8 @@ class WhiteNoiseSpec:
         E.g. ``block_size_px=5`` means each 5×5 pixel region shares one value.
     noise_type:
         ``"white"`` – independent binary (±1) noise per block and frame.
-        ``"pink"``  – binary white noise filtered by a 1/f spatial kernel,
-        producing spatially correlated noise with a 1/f² power spectrum.
+        ``"pink"``  – binary white noise filtered by a 1/f spatiotemporal kernel,
+        producing noise with 1/f correlations in both space and time.
     contrast:
         Peak-to-peak contrast in [0, 1].  With binary noise the pixel range is
         ``[mean_lum - contrast/2, mean_lum + contrast/2]``.
@@ -40,6 +40,14 @@ class WhiteNoiseSpec:
     rgb:
         If True, generate three *independent* noise channels (R, G, B).
         If False, generate a single luminance channel and replicate it to 3.
+    temporal_weight:
+        Controls the relative contribution of temporal frequencies in the 3D
+        pink filter (``noise_type="pink"`` only).  The filter is
+        ``1 / sqrt(f_x² + f_y² + (temporal_weight * f_t)²)``.
+        - Values < 1 → slower temporal variation (longer correlation times).
+        - Values > 1 → faster temporal decorrelation.
+        A good starting point is ``1.0``; tune relative to your fps and the
+        integration window of the neurons you're mapping (DS RGCs ~ 50–100 ms).
     """
 
     num_frames: int = 12
@@ -51,6 +59,7 @@ class WhiteNoiseSpec:
     mean_lum: float = 0.5
     seed: int = 0
     rgb: bool = True
+    temporal_weight: float = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -69,35 +78,51 @@ def _binary_block_noise(
     return (bits.astype(np.float32) * 2.0 - 1.0)
 
 
-def _apply_pink_filter_2d(noise: np.ndarray) -> np.ndarray:
-    """Apply a 1/f amplitude filter in 2-D Fourier space.
+def _apply_pink_filter_3d(
+    noise: np.ndarray,
+    temporal_weight: float = 1.0,
+) -> np.ndarray:
+    """Apply a 1/f amplitude filter in 3-D (time × height × width) Fourier space.
+
+    Unlike a purely spatial 2-D filter, this introduces temporal correlations
+    across frames, which is necessary for mapping motion-selective neurons via
+    reverse correlation.  The filter kernel is:
+
+        H(f_t, f_y, f_x) = 1 / sqrt(f_x² + f_y² + (temporal_weight * f_t)²)
+
+    with the DC component zeroed.
 
     Parameters
     ----------
     noise:
-        Array with shape (..., H, W).  The filter is applied independently to
-        each (...) slice.
+        Array with shape (T, C, bh, bw).  The filter is applied independently
+        to each channel C.
+    temporal_weight:
+        Scales the temporal frequency axis relative to spatial frequencies.
 
     Returns
     -------
-    np.ndarray, same shape, float32
+    np.ndarray, shape (T, C, bh, bw), float32
         Filtered noise, roughly zero-mean.  Values are *not* clipped.
     """
-    *lead, H, W = noise.shape
+    T, C, bh, bw = noise.shape
 
-    fy = np.fft.fftfreq(H).astype(np.float32)[:, None]   # (H, 1)
-    fx = np.fft.fftfreq(W).astype(np.float32)[None, :]   # (1, W)
-    f = np.sqrt(fy ** 2 + fx ** 2)
-    f[0, 0] = 1.0          # avoid division by zero at DC
-    # softer options
-    h_filt = 1.0 / np.sqrt(f)   # 1/f^0.5 amplitude → 1/f power spectrum
-    # h_filt = f ** (-0.75)        # somewhere in between
-    h_filt[0, 0] = 0.0     # zero DC component
+    # Build 3-D frequency grid
+    ft = np.fft.fftfreq(T).astype(np.float32)[:, None, None]   # (T, 1, 1)
+    fy = np.fft.fftfreq(bh).astype(np.float32)[None, :, None]  # (1, bh, 1)
+    fx = np.fft.fftfreq(bw).astype(np.float32)[None, None, :]  # (1, 1, bw)
+
+    f = np.sqrt(fx**2 + fy**2 + (temporal_weight * ft)**2)
+    f[0, 0, 0] = 1.0        # avoid division by zero at DC
+    h_filt = 1.0 / f  # 1/f^0.5 amplitude → 1/f power spectrum
+    h_filt[0, 0, 0] = 0.0  # zero DC
 
     result = np.empty_like(noise, dtype=np.float32)
-    for idx in np.ndindex(*lead):
-        spectrum = np.fft.fft2(noise[idx])
-        result[idx] = np.real(np.fft.ifft2(spectrum * h_filt)).astype(np.float32)
+    for c in range(C):
+        spectrum = np.fft.fftn(noise[:, c, :, :])          # 3-D FFT over (T, bh, bw)
+        result[:, c, :, :] = np.real(
+            np.fft.ifftn(spectrum * h_filt)
+        ).astype(np.float32)
 
     return result
 
@@ -108,10 +133,11 @@ def _pink_block_noise(
     bh: int,
     bw: int,
     rng: np.random.Generator,
+    temporal_weight: float = 1.0,
 ) -> np.ndarray:
-    """Return pink-filtered block noise, shape (T, C, bh, bw) float32 in [-1, 1]."""
+    """Return 3-D pink-filtered block noise, shape (T, C, bh, bw) float32 in [-1, 1]."""
     white = _binary_block_noise(T, C, bh, bw, rng).astype(np.float32)
-    pink = _apply_pink_filter_2d(white)
+    pink = _apply_pink_filter_3d(white, temporal_weight=temporal_weight)
 
     # Normalise to [-1, 1]: scale so ≈4 σ fits the range
     std = pink.std()
@@ -128,9 +154,10 @@ def make_white_noise(spec: WhiteNoiseSpec) -> np.ndarray:
     """Generate a block-based spatiotemporal noise stimulus.
 
     Each of the ``num_frames`` frames contains an independent random noise
-    pattern.  The noise is generated at block-grid resolution and then
-    up-sampled by simple pixel repetition so that every
-    ``block_size_px × block_size_px`` region shares a single value.
+    pattern (white) or a temporally correlated pattern (pink).  The noise is
+    generated at block-grid resolution and then up-sampled by simple pixel
+    repetition so that every ``block_size_px × block_size_px`` region shares
+    a single value.
 
     Parameters
     ----------
@@ -157,7 +184,10 @@ def make_white_noise(spec: WhiteNoiseSpec) -> np.ndarray:
     if spec.noise_type == "white":
         noise = _binary_block_noise(T, C, bh, bw, rng)   # (T, C, bh, bw) in [-1, 1]
     elif spec.noise_type == "pink":
-        noise = _pink_block_noise(T, C, bh, bw, rng)     # (T, C, bh, bw) in [-1, 1]
+        noise = _pink_block_noise(
+            T, C, bh, bw, rng,
+            temporal_weight=spec.temporal_weight,
+        )                                                  # (T, C, bh, bw) in [-1, 1]
     else:
         raise ValueError(
             f"Unknown noise_type={spec.noise_type!r}. "
